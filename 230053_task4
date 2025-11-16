@@ -1,0 +1,314 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import heapq # Thêm thư viện cho Hàng đợi ưu tiên (A*)
+
+# --- CÁC HÀM XỬ LÝ LƯỚI (Giữ nguyên) ---
+
+def bresenham_line(x0, y0, x1, y1):
+    points = []
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    while True:
+        points.append((int(x0), int(y0)))
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+    return points
+
+def load_and_transform_scan(filepath, robot_x, robot_y):
+    try:
+        # Load CSV with numpy (skips header)
+        data = np.loadtxt(filepath, delimiter=",", skiprows=1)
+
+        angles = data[:, 0]
+        distances = data[:, 1]
+
+        # Filter valid distances (same as before)
+        mask = (distances > 0.05) & (distances < 8.0)
+        angles = angles[mask]
+        distances = distances[mask]
+
+        # Local coordinates
+        local_x = distances * np.cos(angles)
+        local_y = distances * np.sin(angles)
+
+        # Convert to global coordinates
+        global_x = local_x + robot_x
+        global_y = local_y + robot_y
+
+        return global_x, global_y
+
+    except Exception as e:
+        print(f"LỖI: Không thể tải file {filepath}: {e}")
+        return np.array([]), np.array([])
+
+
+def world_to_grid_coords(world_x, world_y, min_x, min_y, resolution):
+    grid_x = int((world_x - min_x) / resolution)
+    grid_y = int((world_y - min_y) / resolution)
+    return grid_x, grid_y
+
+def downsample_grid(high_res_grid, target_size_x, target_size_y):
+    print(f"Đang nén bản đồ từ {high_res_grid.shape} xuống ({target_size_y}, {target_size_x})...")
+    high_res_y, high_res_x = high_res_grid.shape
+    low_res_grid = np.full((target_size_y, target_size_x), 0.5) 
+    block_size_x = high_res_x // target_size_x
+    block_size_y = high_res_y // target_size_y
+
+    for y in range(target_size_y):
+        for x in range(target_size_x):
+            start_y, end_y = y * block_size_y, (y + 1) * block_size_y
+            start_x, end_x = x * block_size_x, (x + 1) * block_size_x
+            block = high_res_grid[start_y:end_y, start_x:end_x]
+            
+            if np.any(block == 1.0):
+                low_res_grid[y, x] = 1.0 # Bị chiếm (Tường)
+            elif np.any(block == 0.0):
+                low_res_grid[y, x] = 0.0 # Trống (Đi được)
+            # Nếu không, ô vẫn là 0.5 (Unknown - Tường)
+            
+    return low_res_grid
+
+# --- LỚP NODE VÀ THUẬT TOÁN A* ---
+
+class Node:
+    """Lớp Node cho thuật toán A*"""
+    def __init__(self, position, parent=None):
+        self.position = position # (x, y)
+        self.parent = parent
+        
+        self.g = 0 # Chi phí từ điểm bắt đầu
+        self.h = 0 # Chi phí heuristic (ước lượng) đến điểm kết thúc
+        self.f = 0 # Tổng chi phí (f = g + h)
+
+    def __eq__(self, other):
+        # So sánh 2 node dựa trên vị trí
+        return self.position == other.position
+        
+    def __lt__(self, other):
+        # Dùng để so sánh trong hàng đợi ưu tiên (heapq)
+        return self.f < other.f
+
+    def __repr__(self):
+        return f"Node{self.position} - f: {self.f}"
+
+def find_path_astar(grid, start_pos, end_pos):
+    """
+    Thực thi thuật toán A*
+    grid: Lưới 30x30
+    start_pos: (x, y) của điểm bắt đầu
+    end_pos: (x, y) của điểm kết thúc
+    """
+    print(f"Đang tìm đường đi A* từ {start_pos} đến {end_pos}...")
+
+    # Tạo node Bắt đầu và Kết thúc
+    start_node = Node(start_pos)
+    end_node = Node(end_pos)
+
+    # Khởi tạo 2 danh sách
+    open_list = [] # Hàng đợi ưu tiên (Priority Queue)
+    closed_set = set() # Tập hợp các vị trí đã duyệt
+
+    # Thêm node bắt đầu vào open_list
+    heapq.heappush(open_list, (start_node.f, start_node))
+
+    # Các hướng di chuyển (8 hướng: ngang, dọc, chéo)
+    movements = [(0, 1), (0, -1), (1, 0), (-1, 0), 
+                 (1, 1), (1, -1), (-1, 1), (-1, -1)]
+
+    # Vòng lặp chính của A*
+    while open_list:
+        # Lấy node có chi phí f nhỏ nhất
+        current_node = heapq.heappop(open_list)[1]
+
+        # Nếu đã duyệt, bỏ qua
+        if current_node.position in closed_set:
+            continue
+        closed_set.add(current_node.position)
+
+        # --- KIỂM TRA ĐẾN ĐÍCH ---
+        if current_node == end_node:
+            # Đã đến đích! Dựng lại đường đi
+            path = []
+            current = current_node
+            while current is not None:
+                path.append(current.position)
+                current = current.parent
+            print("  -> Đã tìm thấy đường đi!")
+            return path[::-1] # Trả về đường đi (đã đảo ngược)
+
+        # --- TẠO CÁC NODE CON (HÀNG XÓM) ---
+        for move in movements:
+            # Tính vị trí hàng xóm
+            neighbor_pos = (current_node.position[0] + move[0], 
+                            current_node.position[1] + move[1])
+            
+            # 1. KIỂM TRA BIÊN: Hàng xóm có nằm trong lưới không?
+            if not (0 <= neighbor_pos[0] < grid.shape[1] and \
+                    0 <= neighbor_pos[1] < grid.shape[0]):
+                continue
+
+            # 2. KIỂM TRA TƯỜNG (QUAN TRỌNG!)
+            # Theo yêu cầu của bạn: Chỉ đi được trên ô 0.0 (Trống)
+            # Ô 1.0 (Bị chiếm) và 0.5 (Chưa biết) ĐỀU LÀ TƯỜNG
+            if grid[neighbor_pos[1], neighbor_pos[0]] != 0.0:
+                continue
+
+            # 3. KIỂM TRA CLOSED SET: Hàng xóm đã được duyệt chưa?
+            if neighbor_pos in closed_set:
+                continue
+
+            # Tạo node hàng xóm mới
+            neighbor_node = Node(neighbor_pos, current_node)
+
+            # 4. TÍNH CHI PHÍ
+            # Chi phí di chuyển (1 cho ngang/dọc, 1.414 cho chéo)
+            move_cost = 1.414 if move[0] != 0 and move[1] != 0 else 1
+            neighbor_node.g = current_node.g + move_cost
+            
+            # Heuristic (Octile/Diagonal distance)
+            dx = abs(neighbor_node.position[0] - end_node.position[0])
+            dy = abs(neighbor_node.position[1] - end_node.position[1])
+            neighbor_node.h = (dx + dy) + (1.414 - 2) * min(dx, dy)
+            
+            neighbor_node.f = neighbor_node.g + neighbor_node.h
+
+            # 5. THÊM VÀO OPEN LIST
+            heapq.heappush(open_list, (neighbor_node.f, neighbor_node))
+            
+    # Nếu vòng lặp kết thúc mà không đến đích
+    print("  -> KHÔNG tìm thấy đường đi!")
+    return None
+
+def main():
+    
+    # --- CẤU HÌNH ---
+    pose_13 = (0.15, 1.43)
+    pose_22 = (0.805, 0.91)
+    pose_31 = (0.355, 2.55)
+    scan_definitions = {
+        'lidar_data_13.csv': pose_13,
+        'lidar_data_22.csv': pose_22,
+        'lidar_data_31.csv': pose_31 
+    }
+    RESOLUTION = 0.05
+    TARGET_GRID_X = 30
+    TARGET_GRID_Y = 30
+
+    # === BƯỚC 1: TẠO BẢN ĐỒ PHÂN GIẢI CAO (như trước) ===
+    print("Đang tạo bản đồ phân giải cao...")
+    all_global_x_lists = []
+    all_global_y_lists = []
+    all_robot_x = [p[0] for p in scan_definitions.values()]
+    all_robot_y = [p[1] for p in scan_definitions.values()]
+    for file, (r_x, r_y) in scan_definitions.items():
+        global_x, global_y = load_and_transform_scan(file, r_x, r_y)
+        all_global_x_lists.append(global_x)
+        all_global_y_lists.append(global_y)
+    x_coords = np.concatenate(all_global_x_lists + [all_robot_x])
+    y_coords = np.concatenate(all_global_y_lists + [all_robot_y])
+    min_x = x_coords.min() - 0.5
+    max_x = x_coords.max() + 0.5
+    min_y = y_coords.min() - 0.5
+    max_y = y_coords.max() + 0.5
+    grid_size_x = (int(((max_x - min_x) / RESOLUTION) / TARGET_GRID_X) + 1) * TARGET_GRID_X
+    grid_size_y = (int(((max_y - min_y) / RESOLUTION) / TARGET_GRID_Y) + 1) * TARGET_GRID_Y
+    global_grid = np.full((grid_size_y, grid_size_x), 0.5)
+    for i, (file, (r_x, r_y)) in enumerate(scan_definitions.items()):
+        robot_grid_x, robot_grid_y = world_to_grid_coords(r_x, r_y, min_x, min_y, RESOLUTION)
+        global_x_hits = all_global_x_lists[i]
+        global_y_hits = all_global_y_lists[i]
+        for (hit_wx, hit_wy) in zip(global_x_hits, global_y_hits):
+            hit_grid_x, hit_grid_y = world_to_grid_coords(hit_wx, hit_wy, min_x, min_y, RESOLUTION)
+            line_points = bresenham_line(robot_grid_x, robot_grid_y, hit_grid_x, hit_grid_y)
+            for (px, py) in line_points[:-1]:
+                if 0 <= px < grid_size_x and 0 <= py < grid_size_y:
+                    global_grid[py, px] = 0.0
+            if line_points:
+                last_x, last_y = line_points[-1]
+                if 0 <= last_x < grid_size_x and 0 <= last_y < grid_size_y:
+                    global_grid[last_y, last_x] = 1.0
+    print("...Tạo bản đồ phân giải cao thành công.")
+
+    # === BƯỚC 2: "NÉN" XUỐNG 30x30 ===
+    low_res_grid = downsample_grid(global_grid, TARGET_GRID_X, TARGET_GRID_Y)
+    print("Đã nén xuống 30x30. Bản đồ A* đã sẵn sàng.")
+
+    # === BƯỚC 3: VẼ BẢN ĐỒ TƯƠNG TÁC 30x30 ===
+    print("Hiển thị bản đồ 30x30. Hãy click để chọn điểm.")
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.imshow(low_res_grid, cmap='Greys_r', origin='lower', vmin=0, vmax=1)
+    ax.set_xticks(np.arange(-.5, TARGET_GRID_X, 1), minor=True)
+    ax.set_yticks(np.arange(-.5, TARGET_GRID_Y, 1), minor=True)
+    ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
+    ax.set_xticklabels([])
+    ax.set_yticklabels([])
+    ax.set_title('Bản đồ A* (30x30) - Click để chọn Start/End', fontsize=16)
+
+    # --- Thiết lập tương tác ---
+    app_state = {'start': None, 'end': None, 'last_click': 'end'}
+    
+    # Vẽ sẵn các điểm (ban đầu ẩn)
+    start_marker, = ax.plot([], [], 'go', markersize=12, label='Bắt đầu (Start)')
+    end_marker, = ax.plot([], [], 'rs', markersize=12, label='Kết thúc (End)')
+    # Vẽ sẵn đường đi (ban đầu ẩn)
+    path_line, = ax.plot([], [], 'c-', linewidth=3, label='Đường đi A*') # Màu Cyan
+
+    def onclick(event):
+        if event.xdata is None or event.ydata is None: return
+        grid_x = int(np.floor(event.xdata))
+        grid_y = int(np.floor(event.ydata))
+        if not (0 <= grid_x < TARGET_GRID_X and 0 <= grid_y < TARGET_GRID_Y): return
+
+        # --- KIỂM TRA TƯỜNG ---
+        # Chỉ cho phép click vào ô 0.0 (Trống)
+        if low_res_grid[grid_y, grid_x] != 0.0:
+            print(f"LỖI: Bạn đã click vào TƯỜNG (ô {grid_x}, {grid_y})! Vui lòng chọn lại.")
+            return
+
+        marker_x, marker_y = grid_x + 0.5, grid_y + 0.5
+
+        if app_state['last_click'] == 'end':
+            app_state['start'] = (grid_x, grid_y)
+            start_marker.set_data([marker_x], [marker_y])
+            app_state['last_click'] = 'start'
+            print(f"ĐÃ CHỌN ĐIỂM BẮT ĐẦU (START): Ô ({grid_x}, {grid_y})")
+            # Xóa đường đi cũ (nếu có)
+            path_line.set_data([], [])
+        
+        elif app_state['last_click'] == 'start':
+            app_state['end'] = (grid_x, grid_y)
+            end_marker.set_data([marker_x], [marker_y])
+            app_state['last_click'] = 'end'
+            print(f"ĐÃ CHỌN ĐIỂM KẾT THÚC (END): Ô ({grid_x}, {grid_y})")
+            
+            # --- GỌI A* 
+            if app_state['start'] is not None:
+                path = find_path_astar(low_res_grid, app_state['start'], app_state['end'])
+                
+                if path:
+
+                    path_x = [p[0] + 0.5 for p in path]
+                    path_y = [p[1] + 0.5 for p in path]
+                    path_line.set_data(path_x, path_y)
+                else:
+                    path_line.set_data([], []) # Không tìm thấy đường
+
+        fig.canvas.draw()
+
+    fig.canvas.mpl_connect('button_press_event', onclick)
+    ax.legend(markerscale=1)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
